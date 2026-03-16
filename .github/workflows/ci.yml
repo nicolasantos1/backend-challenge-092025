@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout do código
+      - name: Checkout do codigo
         uses: actions/checkout@v4
 
       - name: Configurar Python
@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Instalar dependências
+      - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
