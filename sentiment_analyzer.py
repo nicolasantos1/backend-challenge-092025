@@ -4,9 +4,10 @@ import re
 import time
 import unicodedata
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 TOKEN_RE = re.compile(r"(?:#\w+(?:-\w+)*)|\b\w+\b", re.UNICODE)
+USER_ID_RE = re.compile(r"^user_[\w]{3,}$", re.UNICODE)
 
 POSITIVE_WORDS = {
     "adorei",
@@ -39,7 +40,7 @@ NEGATIONS = {
     "jamais",
 }
 
-PHI = (1 + 5 ** 0.5) / 2
+PHI = (1 + 5**0.5) / 2
 
 
 def normalize_for_matching(token: str) -> str:
@@ -107,7 +108,6 @@ def classify_sentiment(content: str, user_id: str) -> str:
         return "neutral"
 
     final_score = score / len(word_tokens)
-
     if final_score > 0.1:
         return "positive"
     if final_score < -0.1:
@@ -122,7 +122,8 @@ def is_prime(n: int) -> bool:
         return True
     if n % 2 == 0:
         return False
-    limit = int(n ** 0.5) + 1
+
+    limit = int(n**0.5) + 1
     for i in range(3, limit, 2):
         if n % i == 0:
             return False
@@ -150,20 +151,59 @@ def followers_for_user(user_id: str) -> int:
     return base
 
 
-def engagement_rate(message: dict) -> float:
-    reactions = message.get("reactions", 0) or 0
-    shares = message.get("shares", 0) or 0
-    views = message.get("views", 0) or 0
-
+def engagement_rate_from_totals(reactions: int, shares: int, views: int) -> float:
     if views <= 0:
         return 0.0
 
-    rate = (reactions + shares) / views
+    total_interactions = reactions + shares
+    rate = total_interactions / views
 
-    if (reactions + shares) > 0 and (reactions + shares) % 7 == 0:
+    if total_interactions > 0 and total_interactions % 7 == 0:
         rate *= (1 + 1 / PHI)
 
     return rate
+
+
+def filter_messages_by_time_window(messages: list[dict], time_window_minutes: int) -> list[dict]:
+    if not messages:
+        return []
+
+    parsed = []
+    for msg in messages:
+        msg_copy = dict(msg)
+        msg_copy["_parsed_timestamp"] = parse_timestamp(msg["timestamp"])
+        parsed.append(msg_copy)
+
+    # Referência determinística baseada no payload.
+    # Isso evita depender do relógio real da máquina e mantém os testes previsíveis.
+    reference_time = max(msg["_parsed_timestamp"] for msg in parsed)
+    window_start = reference_time - timedelta(minutes=time_window_minutes)
+
+    return [msg for msg in parsed if msg["_parsed_timestamp"] >= window_start]
+
+
+def has_alternating_sentiment_pattern(user_messages: list[dict]) -> bool:
+    sorted_msgs = sorted(user_messages, key=lambda msg: msg["_parsed_timestamp"])
+
+    binary_sentiments = []
+    for msg in sorted_msgs:
+        sentiment = msg.get("_sentiment")
+        if sentiment in {"positive", "negative"} and not is_meta_message(msg.get("content", "")):
+            binary_sentiments.append(sentiment)
+
+    if len(binary_sentiments) < 10:
+        return False
+
+    run_length = 1
+    for i in range(1, len(binary_sentiments)):
+        if binary_sentiments[i] != binary_sentiments[i - 1]:
+            run_length += 1
+            if run_length >= 10:
+                return True
+        else:
+            run_length = 1
+
+    return False
 
 
 def detect_anomaly(messages: list[dict]) -> bool:
@@ -174,16 +214,9 @@ def detect_anomaly(messages: list[dict]) -> bool:
     for msg in messages:
         by_user[msg.get("user_id", "")].append(msg)
 
+    # 1) Burst: >10 mensagens do mesmo usuário em 5 minutos
     for user_msgs in by_user.values():
-        timestamps = []
-        for msg in user_msgs:
-            try:
-                timestamps.append(parse_timestamp(msg["timestamp"]))
-            except Exception:
-                continue
-
-        timestamps.sort()
-
+        timestamps = sorted(msg["_parsed_timestamp"] for msg in user_msgs)
         for i in range(len(timestamps)):
             j = i + 10
             if j < len(timestamps):
@@ -191,15 +224,13 @@ def detect_anomaly(messages: list[dict]) -> bool:
                 if delta <= 5 * 60:
                     return True
 
-    parsed = []
-    for msg in messages:
-        try:
-            parsed.append(parse_timestamp(msg["timestamp"]))
-        except Exception:
-            pass
+    # 2) Alternância exata: padrão + - + - em >=10 mensagens
+    for user_msgs in by_user.values():
+        if has_alternating_sentiment_pattern(user_msgs):
+            return True
 
-    parsed.sort()
-
+    # 3) Synchronized posting: >=3 mensagens em janela de até 4 segundos
+    parsed = sorted(msg["_parsed_timestamp"] for msg in messages)
     for i in range(len(parsed) - 2):
         if (parsed[i + 2] - parsed[i]).total_seconds() <= 4:
             return True
@@ -228,6 +259,26 @@ def analyze_feed(payload: dict) -> dict:
         }
 
     for msg in messages:
+        user_id = msg.get("user_id", "")
+
+        if not isinstance(user_id, str):
+            return {
+                "_status": 400,
+                "error": "User ID inválido",
+                "code": "INVALID_USER_ID",
+            }
+
+        normalized_user_id = unicodedata.normalize("NFKC", user_id)
+
+        if not USER_ID_RE.fullmatch(normalized_user_id):
+            return {
+                "_status": 400,
+                "error": "User ID inválido",
+                "code": "INVALID_USER_ID",
+            }
+
+        msg["user_id"] = normalized_user_id
+
         content = msg.get("content", "")
         if not isinstance(content, str) or len(content) > 280:
             return {
@@ -255,6 +306,8 @@ def analyze_feed(payload: dict) -> dict:
                 "code": "INVALID_HASHTAGS",
             }
 
+    scoped_messages = filter_messages_by_time_window(messages, time_window_minutes)
+
     flags = {
         "mbras_employee": False,
         "special_pattern": False,
@@ -264,7 +317,7 @@ def analyze_feed(payload: dict) -> dict:
     counted_sentiments = []
     message_sentiments = []
 
-    for msg in messages:
+    for msg in scoped_messages:
         user_id = msg.get("user_id", "")
         content = msg.get("content", "")
 
@@ -278,6 +331,7 @@ def analyze_feed(payload: dict) -> dict:
             flags["candidate_awareness"] = True
 
         sentiment = classify_sentiment(content, user_id)
+        msg["_sentiment"] = sentiment
         message_sentiments.append(sentiment)
 
         if not is_meta_message(content):
@@ -301,30 +355,32 @@ def analyze_feed(payload: dict) -> dict:
 
     hashtag_weight = defaultdict(float)
     hashtag_freq = Counter()
-
     sentiment_modifier_map = {
         "positive": 1.2,
         "negative": 0.8,
         "neutral": 1.0,
+        "meta": 1.0,
     }
 
-    now_utc = datetime.now(timezone.utc)
+    reference_time = max((msg["_parsed_timestamp"] for msg in scoped_messages), default=None)
 
-    for msg, sentiment in zip(messages, message_sentiments):
-        msg_ts = parse_timestamp(msg["timestamp"])
-        minutes_diff = max((now_utc - msg_ts).total_seconds() / 60.0, 0.01)
+    if reference_time is not None:
+        for msg, sentiment in zip(scoped_messages, message_sentiments):
+            minutes_diff = max(
+                (reference_time - msg["_parsed_timestamp"]).total_seconds() / 60.0,
+                1.0,
+            )
+            time_weight = 1 + (1 / minutes_diff)
+            sentiment_modifier = sentiment_modifier_map[sentiment]
 
-        time_weight = 1 + (1 / minutes_diff)
-        sentiment_modifier = sentiment_modifier_map[sentiment]
+            for hashtag in msg.get("hashtags", []):
+                factor = 1.0
+                if len(hashtag) > 8:
+                    factor = math.log10(len(hashtag)) / math.log10(8)
 
-        for hashtag in msg.get("hashtags", []):
-            factor = 1.0
-            if len(hashtag) > 8:
-                factor = math.log10(len(hashtag)) / math.log10(8)
-
-            weight = time_weight * sentiment_modifier * factor
-            hashtag_weight[hashtag] += weight
-            hashtag_freq[hashtag] += 1
+                weight = time_weight * sentiment_modifier * factor
+                hashtag_weight[hashtag] += weight
+                hashtag_freq[hashtag] += 1
 
     trending_topics = [
         item[0]
@@ -334,17 +390,25 @@ def analyze_feed(payload: dict) -> dict:
         )[:5]
     ]
 
-    user_metrics = {}
-
-    for msg in messages:
+    aggregated_users = defaultdict(lambda: {"reactions": 0, "shares": 0, "views": 0})
+    for msg in scoped_messages:
         user_id = msg.get("user_id", "")
+        aggregated_users[user_id]["reactions"] += msg.get("reactions", 0) or 0
+        aggregated_users[user_id]["shares"] += msg.get("shares", 0) or 0
+        aggregated_users[user_id]["views"] += msg.get("views", 0) or 0
+
+    user_metrics = {}
+    for user_id, totals in aggregated_users.items():
         followers = followers_for_user(user_id)
-        rate = engagement_rate(msg)
+        rate = engagement_rate_from_totals(
+            totals["reactions"],
+            totals["shares"],
+            totals["views"],
+        )
         influence = (followers * 0.4) + (rate * 0.6)
 
         if user_id.lower().endswith("007"):
             influence *= 0.5
-
         if "mbras" in user_id.lower():
             influence += 2.0
 
@@ -374,7 +438,7 @@ def analyze_feed(payload: dict) -> dict:
         "engagement_score": engagement_score,
         "trending_topics": trending_topics,
         "influence_ranking": influence_ranking,
-        "anomaly_detected": detect_anomaly(messages),
+        "anomaly_detected": detect_anomaly(scoped_messages),
         "flags": flags,
         "processing_time_ms": round((time.perf_counter() - start) * 1000, 3),
     }
