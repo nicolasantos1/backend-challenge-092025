@@ -214,7 +214,7 @@ def detect_anomaly(messages: list[dict]) -> bool:
     for msg in messages:
         by_user[msg.get("user_id", "")].append(msg)
 
-    # 1) Burst: >10 mensagens do mesmo usuário em 5 minutos
+    # 1) Burst: > 10 mensagens do mesmo usuário em 5 minutos
     for user_msgs in by_user.values():
         timestamps = sorted(msg["_parsed_timestamp"] for msg in user_msgs)
         for i in range(len(timestamps)):
